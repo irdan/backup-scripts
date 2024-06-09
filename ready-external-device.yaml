@@ -1,0 +1,182 @@
+---
+- name: Configure and format NVMe drive
+  hosts: localhost
+  gather_facts: no
+  vars_files:
+    - vars.yaml
+
+  tasks:
+    - name: Ensure required packages are installed (Debian/Ubuntu)
+      become: yes
+      apt:
+        name: 
+          - restic
+          - zfsutils-linux
+        state: present
+
+    - name: Check if serial_number variable is provided
+      fail:
+        msg: "The serial_number variable is required. Set in vars.yaml or pass as an argument, e.g., -e 'serial_number=12345'"
+      when: serial_number == ""
+
+    # -----------------------------------------------------------------------
+    # Section: Get device from provided serial number
+    # -----------------------------------------------------------------------
+    - name: List all block devices with their serial numbers
+      command: lsblk -o NAME,SERIAL
+      register: all_devices
+
+    - name: Find the device with the matching serial number
+      shell: |
+        lsblk -d -o NAME,SERIAL | grep {{ serial_number }} | awk '{print $1}'
+      register: matching_device
+      changed_when: false
+
+    - name: Check if matching device was found
+      fail:
+        msg: "No device found with the serial number {{ serial_number }}"
+      when: matching_device.stdout == ""
+
+    # -----------------------------------------------------------------------
+    # Section: Show device info and confirm with user
+    # -----------------------------------------------------------------------
+    - name: Get detailed information about the matching device using lsblk
+      command: lsblk -o NAME,MODEL,SIZE,VENDOR,SERIAL /dev/{{ matching_device.stdout | trim }}
+      register: device_details_lsblk
+      changed_when: false
+
+    - name: Get detailed information about the matching device using udevadm
+      command: udevadm info --query=all --name=/dev/{{ matching_device.stdout | trim }}
+      register: device_details_udevadm
+      changed_when: false
+
+    - name: Display matching device details from lsblk
+      debug:
+        msg: "Device details (lsblk):\n{{ device_details_lsblk.stdout }}"
+
+    - name: Display matching device details from udevadm
+      debug:
+        msg: "Device details (udevadm):\n{{ device_details_udevadm.stdout }}"
+
+    - name: Confirm matching device with user
+      pause:
+        prompt: |
+          Is this the correct device?
+          Device details (lsblk):
+          {{ device_details_lsblk.stdout }}
+          Device details (udevadm):
+          {{ device_details_udevadm.stdout }}
+          (y/n)
+      register: user_confirmation
+
+    - name: Fail if user does not confirm the device
+      fail:
+        msg: "Operation aborted by user."
+      when: user_confirmation.user_input != "y"
+
+    - name: Set device variable
+      set_fact:
+        device: "/dev/{{ matching_device.stdout | trim }}"
+
+    # -----------------------------------------------------------------------
+    # Section: Create ZFS pool and dataset on device
+    # -----------------------------------------------------------------------
+    - name: Unmount device if it is mounted
+      become: yes
+      shell: |
+        umount {{ device }}* 2>/dev/null || true
+      ignore_errors: yes
+
+    - name: Set zpool name based on serial number
+      set_fact:
+        zpool_name: "zpool_{{ serial_number }}"
+
+    - name: Check if ZFS pool exists
+      become: yes
+      command: zpool list {{ zpool_name }}
+      register: zpool_check
+      ignore_errors: true
+      changed_when: false
+
+    - name: Create ZFS pool
+      become: yes
+      command: zpool create -f {{ zpool_name }} {{ device }}
+      when: zpool_check.rc != 0
+
+    - name: Check if ZFS dataset exists
+      become: yes
+      command: zfs list {{ zpool_name }}/{{ dataset_name }}
+      register: zfs_dataset_check
+      ignore_errors: true
+      changed_when: false
+
+    - name: Create ZFS dataset
+      become: yes
+      command: zfs create {{ zpool_name }}/{{ dataset_name }}
+      when: zfs_dataset_check.rc != 0
+
+    - name: Set ZFS dataset properties
+      become: yes
+      command: >
+        zfs set
+        atime=off
+        compression=on
+        checksum=sha256
+        dedup=off
+        copies=2
+        {{ zpool_name }}/{{ dataset_name }}
+
+    - name: Display ZFS pool details
+      become: yes
+      command: zpool get all {{ zpool_name }}
+      register: zpool_details
+
+    - name: Display ZFS pool status
+      become: yes
+      command: zpool status {{ zpool_name }}
+      register: zpool_status
+
+    - name: Display ZFS dataset properties
+      become: yes
+      command: zfs get all {{ zpool_name }}/{{ dataset_name }}
+      register: zfs_properties
+
+    - name: Show ZFS pool details
+      debug:
+        var: zpool_details.stdout_lines
+
+    - name: Show ZFS pool status
+      debug:
+        var: zpool_status.stdout_lines
+
+    - name: Show ZFS dataset properties
+      debug:
+        var: zfs_properties.stdout_lines
+
+    # -----------------------------------------------------------------------
+    # Section: Create restic repo 
+    # -----------------------------------------------------------------------
+    - name: Ensure Restic password file exists and is readable
+      become: yes
+      file:
+        path: "{{ restic_password_file }}"
+        state: file
+        mode: '0600'
+
+    - name: Validate Restic password file content
+      become: yes
+      command: cat {{ restic_password_file }}
+      register: password_file_content
+
+    - name: Fail if password file is empty
+      fail:
+        msg: "Restic password file is empty or unreadable!"
+      when: password_file_content.stdout == ""
+
+    - name: Initialize Restic repository
+      become: yes
+      command: >
+        restic -r {{ restic_repo }} --password-file {{ restic_password_file }} init
+      args:
+        creates: "{{ restic_repo }}/config"
+

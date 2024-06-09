@@ -1,0 +1,268 @@
+---
+- name: Perform backup on ZFS pool
+  hosts: localhost
+  gather_facts: no
+  vars_files:
+    - vars.yaml
+
+  tasks:
+
+    - name: Ensure required packages are installed
+      become: yes
+      apt:
+        name:
+          - restic
+          - zfsutils-linux
+          - smartmontools
+        state: present
+
+    # -----------------------------------------------------------------------
+    # Section: Import ZFS pool if it isn't already
+    # -----------------------------------------------------------------------
+    - name: Check if ZFS pool is already imported
+      become: yes
+      shell: zpool list -H -o name | grep -w {{ zpool_name }}
+      register: zpool_check
+      ignore_errors: true
+      changed_when: false
+
+    - name: Import ZFS pool
+      become: yes
+      command: zpool import {{ zpool_name }}
+      when: zpool_check.rc != 0
+
+    # -----------------------------------------------------------------------
+    # Section: Get device identifier
+    # -----------------------------------------------------------------------
+    - name: Get detailed information about block devices
+      command: lsblk -o NAME,UUID -nr
+      register: lsblk_output
+      failed_when: lsblk_output.rc != 0
+
+    - name: Get pool UUID
+      command: zpool get -H -o value guid {{ zpool_name }}
+      register: zpool_uuid_output
+      failed_when: zpool_uuid_output.rc != 0
+
+    - name: Extract the pool UUID
+      set_fact:
+        pool_uuid: "{{ zpool_uuid_output.stdout.strip() }}"
+
+    - name: Find the device identifier associated with the ZFS pool
+      set_fact:
+        device_identifier: >-
+          {% for line in lsblk_output.stdout_lines %}
+          {% set parts = line.split() %}
+          {% if pool_uuid in parts %}
+          /dev/{{ parts[0] }}
+          {% endif %}
+          {% endfor %}
+
+    # -----------------------------------------------------------------------
+    # Section: Run Smartmon on attached device
+    # -----------------------------------------------------------------------
+    - name: Run SMART overall-health self-assessment test
+      become: yes
+      command: smartctl -H {{ device_identifier }}
+      register: smart_health_output
+      failed_when: false
+
+    - name: Check SMART health status
+      set_fact:
+        smart_health_status: "{{ 'PASSED' if smart_health_output.rc == 0 else 'FAILED' }}"
+
+    - name: Run detailed SMART test
+      become: yes
+      command: smartctl -a {{ device_identifier }}
+      register: smart_details_output
+      failed_when: false
+
+    - name: Check for specific SMART errors
+      set_fact:
+        smart_errors: "{{ smart_details_output.stdout | regex_findall('Error: .*') }}"
+
+    - name: Alert user to SMART status
+      debug:
+        msg: >
+          {% if smart_health_status == 'FAILED' or smart_errors | length > 0 %}
+          WARNING: Issues detected with {{ device_identifier }}. Please check SMART status.
+          {% else %}
+          SMART status for {{ device_identifier | trim }} is healthy.
+          {% endif %}
+
+    # -----------------------------------------------------------------------
+    # Section: Validate ZFS by performing scrub
+    # -----------------------------------------------------------------------
+    - name: Validate ZFS pool by performing a scrub
+      become: yes
+      command: zpool scrub {{ zpool_name }}
+
+    - name: Wait for scrub to complete
+      become: yes
+      command: zpool status {{ zpool_name }}
+      register: scrub_status
+      until: "'scrub in progress' not in scrub_status.stdout"
+      retries: 10000
+      delay: 60
+
+    # -----------------------------------------------------------------------
+    # Section: Take a backup using restic
+    # -----------------------------------------------------------------------
+    - name: Construct exclude options for Restic backup
+      set_fact:
+        exclude_options: >-
+          {% for dir in exclude_dirs %}
+          --exclude {{ dir }}
+          {% endfor %}
+      vars:
+        exclude_options: "{{ exclude_dirs | map('regex_replace', '^(.*)$', '--exclude \\1') | join(' ') }}"
+
+    - name: Perform Restic backup
+      become: yes
+      async: 360000  # Run the task asynchronously for up to 100 hours
+      poll: 10    # Poll every 10 seconds for status
+      command: >
+        restic -r {{ restic_repo }} --password-file {{ restic_password_file }}
+        backup {{ dir_to_backup }} {{ exclude_options }}
+      register: restic_backup_result
+
+    # -----------------------------------------------------------------------
+    # Section: Get list of restic files 
+    #    Don't use json from restic, ansible is 100x slower than this approach for some reason
+    # -----------------------------------------------------------------------
+    - name: List files in Restic repository
+      become: yes
+      command: >
+        restic -r {{ restic_repo }} --password-file {{ restic_password_file }} ls latest
+      register: restic_file_list
+
+    - name: Set the list of files
+      set_fact:
+        restic_files: "{{ restic_file_list.stdout_lines }}"
+
+    # -----------------------------------------------------------------------
+    # Section: Get a random file from restic
+    # -----------------------------------------------------------------------
+    - name: Define the Python script
+      set_fact:
+        python_script: |
+          import os
+          import random
+          import sys
+          import json
+
+          def get_random_file(files_and_dirs):
+              sample = random.sample(files_and_dirs, min(20, len(files_and_dirs)))
+              files_only = [item for item in sample if not os.path.isdir(item)]
+
+              if files_only:
+                  print(random.choice(files_only))
+                  sys.exit(0)
+              else:
+                  sys.exit(1)
+
+          if __name__ == "__main__":
+              files_and_dirs = json.loads(sys.stdin.read())
+              get_random_file(files_and_dirs)
+
+    - name: Serialize files and directories list
+      set_fact:
+        files_and_dirs_json: "{{ restic_files | to_json }}"
+
+    - name: Execute the Python script with stdin
+      command: "python3 -c '{{ python_script }}'"
+      args:
+        stdin: "{{ files_and_dirs_json }}"
+      register: result
+      ignore_errors: yes
+
+    - name: Fail if no file was found
+      fail:
+        msg: "No file was found in the list."
+      when: result.rc != 0
+
+    - name: Store the output
+      set_fact:
+        random_file: "{{ result.stdout }}"
+
+    - name: Debug restored_file
+      debug:
+        var: random_file
+
+
+    # -----------------------------------------------------------------------
+    # Section: compare sha256sum of the original and restored file
+    # -----------------------------------------------------------------------
+    - name: Get checksum of the original file
+      become: yes
+      command: sha256sum {{ random_file }}
+      register: original_checksum
+
+    - name: Restore the random file to a temporary location
+      become: yes
+      command: >
+        restic -r {{ restic_repo }} --password-file {{ restic_password_file }}
+        restore latest --target /tmp/restic_restore --include "{{ random_file }}"
+
+    - name: Verify the restored file exists
+      become: yes
+      stat:
+        path: "/tmp/restic_restore{{ random_file }}"
+      register: restored_file
+
+#    - name: Debug restored_file
+#      debug:
+#        var: restored_file
+#
+#    - name: Debug original_checksum
+#      debug:
+#        var: original_checksum
+
+    - name: Ensure the restored file exists
+      fail:
+        msg: "Restored file does not exist!"
+      when: not restored_file.stat.exists
+
+    - name: Get checksum of the restored file
+      become: yes
+      command: sha256sum /tmp/restic_restore{{ random_file }}
+      register: restored_checksum
+
+    - name: Ensure the checksums match
+      fail:
+        msg: "The checksum of the restored file does not match the original file!"
+      when: original_checksum.stdout.split()[0] != restored_checksum.stdout.split()[0]
+
+    - name: Clean up the restored file
+      become: yes
+      file:
+        path: /tmp/restic_restore
+        state: absent
+
+    # -----------------------------------------------------------------------
+    # Section: Take a ZFS snapshot
+    # -----------------------------------------------------------------------
+    - name: Set snapshot timestamp
+      set_fact:
+        timestamp: "{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}"
+
+    - name: Create ZFS snapshot
+      become: yes
+      command: zfs snapshot {{ zpool_name }}/{{ dataset_name }}@{{ timestamp }}
+
+    # -----------------------------------------------------------------------
+    # Section: Ensure device can be safely removed
+    # -----------------------------------------------------------------------
+    - name: Export ZFS pool
+      become: yes
+      command: zpool export {{ zpool_name }}
+
+    - name: Ensure no remaining mounts
+      command: mount | grep {{ zpool_name }}
+      register: mount_check
+      failed_when: mount_check.rc == 0
+      changed_when: false
+
+    - name: Power off the drive
+      command: udisksctl power-off -b {{ device_identifier }}
+
