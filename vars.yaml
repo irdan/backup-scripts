@@ -1,0 +1,14 @@
+serial_number: ""
+
+zpool_name: "zpool_{{ serial_number }}"
+dataset_name: "offlinebackup"
+
+restic_repo: "/{{ zpool_name }}/{{ dataset_name }}" # destination of backup
+restic_password_file: "/path/to/your/restic/password/file"
+
+dir_to_backup: "/path/to/your/desired/backup" # source of backup
+
+exclude_dirs:
+  - "/stuff/you/dont/want/backed/up"
+  - "/other/stuff/you/dont/want/backed/up"
+
